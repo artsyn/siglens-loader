@@ -1,0 +1,37 @@
+---
+## Конфиг SigLens для разбора старых логов. Лежит рядом с siglens_up.sh.
+
+ingestListenIP: "[::]"
+ingestPort: 8081
+
+queryListenIP: "[::]"
+queryPort: 5122
+
+dataPath : data/
+
+## Из этого поля события SigLens берёт время (в миллисекундах)
+timestampKey : timestamp
+
+pqsEnabled: true
+
+esVersion: "7.9.3"
+
+## Сколько часов хранить данные. 720 (30 дней) это максимум для SigLens 1.0.57:
+## значение больше он молча сбрасывает обратно на 720.
+retentionHours: 720
+
+ssInstanceName: "sigsingle"
+
+log:
+  logPrefix : ./logs/
+
+tls:
+  enabled: false
+  certificatePath: ""
+  privateKeyPath: ""
+  mtlsEnabled: false
+  clientCaPath: ""
+
+queryHostname: ""
+
+queryTimeoutSecs: 300
