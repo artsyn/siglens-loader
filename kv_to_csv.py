@@ -6,104 +6,129 @@
   DNS-сервер Windows: syslog-заголовок, дальше AgentDevice=WindowsDNS ...
   Cisco FirePower (eStreamer): DeviceType=Estreamer ... flowStatistics.* ...
 
-Исходные поля сохраняются, имена приводятся к виду без пробелов и точек:
-"Question Name" -> QuestionName, flowStatistics.responderPort -> ResponderPort.
-Для поиска по обоим источникам сразу добавляются общие колонки:
-  EventTime  время события в UTC
-  SourceType dns / firepower
-  SrcIp, SrcPort, DstIp, DstPort, Protocol, Domain
+По умолчанию в CSV попадают только полезные поля под общими именами,
+чтобы DNS и соединения искались одним запросом (см. COLUMNS).
+С ключом --all-fields к ним добавляются все исходные поля.
 
-Время в UTC, поэтому отправлять в SigLens с ключом --utc.
+EventTime пишется как в логе, с поясом: 2021-09-07 11:23:53+0300.
 
 Использование:
   python3 kv_to_csv.py logs.txt
-  python3 kv_to_csv.py logs.txt -o out/caldera.csv --tz +05:00
+  python3 kv_to_csv.py logs.txt -o out/caldera.csv --tz +05:00 --all-fields
 """
 import argparse
 import csv
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
-TIME_FMT = "%Y-%m-%d %H:%M:%S"
-COMMON = ["EventTime", "SourceType", "SrcIp", "SrcPort", "DstIp", "DstPort", "Protocol", "Domain"]
+TIME_FMT = "%Y-%m-%d %H:%M:%S%z"
+COLUMNS = [
+    # общие
+    "EventTime", "SourceType", "Device", "SrcIp", "SrcPort", "DstIp", "DstPort", "Protocol", "Domain",
+    # DNS
+    "DnsQueryType", "DnsResponseCode", "DnsMessage", "DnsId",
+    # FirePower
+    "RuleAction", "RuleReason", "PacketsSent", "PacketsReceived", "BytesSent", "BytesReceived",
+    "Url", "SecurityIntelligence",
+]
+INT_COLUMNS = "SrcPort,DstPort,PacketsSent,PacketsReceived,BytesSent,BytesReceived"
 SYSLOG = ["SyslogPri", "SyslogTime", "SyslogHost"]
 SYSLOG_HEADER = re.compile(r"^<(\d+)>(\w{3} [ \d]\d \d\d:\d\d:\d\d) (\S+) (.*)$")
 PROTOCOLS = {"6": "TCP", "17": "UDP", "1": "ICMP"}
+FP = "flowStatistics."
 # Эти имена SigLens забирает себе, в событие они бы не попали
 RESERVED = ("timestamp", "index")
 
 
-def column_name(key):
-    """'Question Name' -> QuestionName, flowStatistics.bytesSent -> BytesSent."""
-    key = key.removeprefix("flowStatistics.")
-    name = "".join(p[0].upper() + p[1:] for p in re.split(r"[^0-9A-Za-z]+", key) if p)
-    # Служебные имена SigLens и совпадения с общими колонками: исходное поле с префиксом Orig
-    if name.lower() in RESERVED or name in COMMON:
-        name = "Orig" + name
-    return name
-
-
 def parse_line(line):
-    """Строка лога -> словарь {колонка: значение}. Пустая строка -> None."""
+    """Строка лога -> словарь исходных полей. Пустая строка -> None."""
     line = line.strip()
     if not line:
         return None
-    fields = {}
+    raw = {}
     match = SYSLOG_HEADER.match(line)
     if match:
-        fields.update(zip(SYSLOG, match.groups()[:3]))
+        raw.update(zip(SYSLOG, match.groups()[:3]))
         line = match.group(4)
     for token in line.split("\t"):
         key, sep, value = token.partition("=")
         if sep and key.strip():
-            fields[column_name(key.strip())] = value.strip()
-    return fields
+            raw[key.strip()] = value.strip()
+    return raw
 
 
-def to_utc(text, time_format, tz):
-    dt = datetime.strptime(text, time_format).replace(tzinfo=tz)
-    return dt.astimezone(timezone.utc).strftime(TIME_FMT)
-
-
-def add_dns(f, tz):
-    f["SourceType"] = "dns"
-    # Время на DNS-сервере, местное
-    f["EventTime"] = to_utc(f"{f['Date']} {f['Time']}", "%d.%m.%Y %H:%M:%S", tz)
-    # Remote IP это всегда вторая сторона: клиент для Rcv, адресат для Snd
-    side = "SrcIp" if f.get("SendReceiveIndicator") == "Rcv" else "DstIp"
-    f[side] = f.get("RemoteIP", "")
-    f["Protocol"] = f.get("UDPTCPIndicator", "")
+def from_dns(raw, tz):
+    # Время на самом DNS-сервере, местное. Syslog-заголовок пишется при пересылке
+    dt = datetime.strptime(f"{raw['Date']} {raw['Time']}", "%d.%m.%Y %H:%M:%S").replace(tzinfo=tz)
     # В сыром dns_debug.log имена пишутся как (3)www(4)bing(3)com(0)
-    name = re.sub(r"\(\d+\)", ".", f.get("QuestionName", "")).strip(".")
-    f["Domain"] = name.lower()
+    name = re.sub(r"\(\d+\)", ".", raw.get("Question Name", "")).strip(".").lower()
+    qr = raw.get("Query/Response", "")
+    row = {
+        "EventTime": dt.strftime(TIME_FMT),
+        "SourceType": "dns",
+        "Device": raw.get("SyslogHost", ""),
+        "Protocol": raw.get("UDP/TCP indicator", ""),
+        "Domain": name,
+        "DnsQueryType": raw.get("Question Type", ""),
+        "DnsResponseCode": raw.get("ResponseCode", ""),
+        "DnsMessage": {"Q": "query", "R": "response"}.get(qr, qr),
+        "DnsId": raw.get("Xid (hex)", ""),
+    }
+    # Remote IP это всегда вторая сторона: клиент для Rcv, адресат для Snd
+    side = "SrcIp" if raw.get("Send/Receive indicator") == "Rcv" else "DstIp"
+    row[side] = raw.get("Remote IP", "")
+    return row
 
 
-def add_firepower(f, tz):
-    f["SourceType"] = "firepower"
+def from_firepower(raw, tz):
     # Начало соединения, unix-время. Если его нет, время записи (местное)
-    first = f.get("FirstPacketTimestamp", "0")
+    first = raw.get(FP + "firstPacketTimestamp", "0")
     if first not in ("", "0"):
-        dt = datetime.fromtimestamp(int(first), timezone.utc)
-        f["EventTime"] = dt.strftime(TIME_FMT)
+        dt = datetime.fromtimestamp(int(first), tz)
     else:
-        f["EventTime"] = to_utc(f["OrigTimestamp"], "%d %b %Y %H:%M:%S", tz)
-    f["SrcIp"] = f.get("InitiatorIPAddress", "")
-    f["SrcPort"] = f.get("InitiatorPort", "")
-    f["DstIp"] = f.get("ResponderIPAddress", "")
-    f["DstPort"] = f.get("ResponderPort", "")
-    f["Protocol"] = PROTOCOLS.get(f.get("OrigProtocol", ""), f.get("OrigProtocol", ""))
-    url = f.get("ClientAppURL", "")
-    f["Domain"] = (urlsplit(url).hostname or "") if url else ""
+        dt = datetime.strptime(raw["timestamp"], "%d %b %Y %H:%M:%S").replace(tzinfo=tz)
+    url = raw.get(FP + "clientAppURL", "")
+    proto = raw.get(FP + "protocol", "")
+    lists = [v for k, v in raw.items()
+             if k.startswith(FP + "securityIntelligenceList") and k.endswith(".securityIntelligenceListName")]
+    return {
+        "EventTime": dt.strftime(TIME_FMT),
+        "SourceType": "firepower",
+        "Device": raw.get("DeviceAddress", ""),
+        "SrcIp": raw.get(FP + "initiatorIPAddress", ""),
+        "SrcPort": raw.get(FP + "initiatorPort", ""),
+        "DstIp": raw.get(FP + "responderIPAddress", ""),
+        "DstPort": raw.get(FP + "responderPort", ""),
+        "Protocol": PROTOCOLS.get(proto, proto),
+        "Domain": (urlsplit(url).hostname or "") if url else "",
+        "RuleAction": raw.get(FP + "ruleAction", ""),
+        "RuleReason": raw.get(FP + "ruleReason", ""),
+        "PacketsSent": raw.get(FP + "packetsSent", ""),
+        "PacketsReceived": raw.get(FP + "packetsReceived", ""),
+        "BytesSent": raw.get(FP + "bytesSent", ""),
+        "BytesReceived": raw.get(FP + "bytesReceived", ""),
+        "Url": url,
+        "SecurityIntelligence": ",".join(lists),
+    }
 
 
-def tz_drift(f, tz):
+def column_name(key):
+    """Имя исходного поля для --all-fields: 'Question Name' -> QuestionName, flowStatistics.bytesSent -> OrigBytesSent."""
+    key = key.removeprefix(FP)
+    name = "".join(p[0].upper() + p[1:] for p in re.split(r"[^0-9A-Za-z]+", key) if p)
+    if name.lower() in RESERVED or name in COLUMNS:
+        name = "Orig" + name
+    return name
+
+
+def tz_drift(raw, tz):
     """На сколько секунд местное время записи FirePower расходится с CurrentTime при этом поясе."""
     try:
-        local = datetime.strptime(f["OrigTimestamp"], "%d %b %Y %H:%M:%S").replace(tzinfo=tz)
-        return abs(local.timestamp() - int(f["CurrentTime"]) / 1000)
+        local = datetime.strptime(raw["timestamp"], "%d %b %Y %H:%M:%S").replace(tzinfo=tz)
+        return abs(local.timestamp() - int(raw["CurrentTime"]) / 1000)
     except (KeyError, ValueError):
         return None
 
@@ -114,6 +139,7 @@ def main():
     parser.add_argument("-o", "--out", type=Path, help="куда писать CSV (по умолчанию рядом с логом)")
     parser.add_argument("--tz", default="+03:00",
                         help="часовой пояс, в котором записано местное время в логе (по умолчанию +03:00)")
+    parser.add_argument("--all-fields", action="store_true", help="добавить в CSV все исходные поля")
     args = parser.parse_args()
 
     if not args.log.exists():
@@ -126,13 +152,14 @@ def main():
     out_path = args.out or args.log.with_suffix(".csv")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Первый проход: собрать все колонки, у DNS и FirePower они разные
-    columns = dict.fromkeys(COMMON + SYSLOG)
-    with open(args.log, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            fields = parse_line(line)
-            if fields:
-                columns.update(dict.fromkeys(fields))
+    columns = dict.fromkeys(COLUMNS)
+    if args.all_fields:
+        # Первый проход: собрать имена исходных полей, у DNS и FirePower они разные
+        with open(args.log, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = parse_line(line)
+                if raw:
+                    columns.update(dict.fromkeys(column_name(k) for k in raw))
 
     counts = {}
     drift_warned = False
@@ -141,15 +168,15 @@ def main():
         writer = csv.DictWriter(dst, fieldnames=list(columns))
         writer.writeheader()
         for number, line in enumerate(src, start=1):
-            fields = parse_line(line)
-            if not fields:
+            raw = parse_line(line)
+            if not raw:
                 continue
             try:
-                if fields.get("AgentDevice") == "WindowsDNS":
-                    add_dns(fields, tz)
-                elif fields.get("DeviceType") == "Estreamer":
-                    add_firepower(fields, tz)
-                    drift = tz_drift(fields, tz)
+                if raw.get("AgentDevice") == "WindowsDNS":
+                    row = from_dns(raw, tz)
+                elif raw.get("DeviceType") == "Estreamer":
+                    row = from_firepower(raw, tz)
+                    drift = tz_drift(raw, tz)
                     if drift is not None and drift > 300 and not drift_warned:
                         print(f"[!] Строка {number}: время FirePower с поясом {args.tz} расходится "
                               f"с CurrentTime на {drift / 3600:.1f} ч, проверь --tz")
@@ -159,15 +186,16 @@ def main():
                              f"или DeviceType=Estreamer")
             except (KeyError, ValueError) as e:
                 sys.exit(f"[!] Строка {number}: не разобрал время ({type(e).__name__}: {e})")
-            writer.writerow(fields)
-            counts[fields["SourceType"]] = counts.get(fields["SourceType"], 0) + 1
+            if args.all_fields:
+                row.update((column_name(k), v) for k, v in raw.items())
+            writer.writerow(row)
+            counts[row["SourceType"]] = counts.get(row["SourceType"], 0) + 1
 
     total = sum(counts.values())
     by_source = ", ".join(f"{k} {v}" for k, v in counts.items())
-    print(f"[+] {args.log.name}: {total} строк ({by_source}) -> {out_path}")
-    print(f"    Отправка: python3 send_to_siglens.py {out_path} --index <индекс> "
-          f"--time-column EventTime --utc --int-columns SrcPort,DstPort,BytesSent,BytesReceived,"
-          f"PacketsSent,PacketsReceived")
+    print(f"[+] {args.log.name}: {total} строк ({by_source}), колонок {len(columns)} -> {out_path}")
+    print(f"    Отправка: python3 send_to_siglens.py {out_path} --index <индекс> --time-column EventTime "
+          f"--time-format '%Y-%m-%d %H:%M:%S%z' --int-columns {INT_COLUMNS}")
 
 
 if __name__ == "__main__":

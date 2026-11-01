@@ -75,24 +75,34 @@ python3 send_to_siglens.py mail_log.csv
 ```bash
 ./siglens_up.sh
 python3 kv_to_csv.py logs.txt
-python3 send_to_siglens.py logs.csv --index caldera --time-column EventTime --utc \
-    --int-columns SrcPort,DstPort,BytesSent,BytesReceived,PacketsSent,PacketsReceived
+python3 send_to_siglens.py logs.csv --index caldera --time-column EventTime \
+    --time-format '%Y-%m-%d %H:%M:%S%z' \
+    --int-columns SrcPort,DstPort,PacketsSent,PacketsReceived,BytesSent,BytesReceived
 ```
 
 Парсер в конце сам печатает нужную команду отправки.
 
-Что делает `kv_to_csv.py`:
+В исходном логе у события больше 60 полей, и большая часть из них бесполезна для разбора: нули, `MACAddress=00:00:00:00:00:00`, версия агента, внутренние идентификаторы. Поэтому по умолчанию в CSV попадает 21 колонка под общими именами:
 
-- Сохраняет все исходные поля, но убирает из имён пробелы и точки: `Question Name` становится `QuestionName`, `flowStatistics.responderPort` становится `ResponderPort`.
-- Добавляет общие колонки `EventTime`, `SourceType`, `SrcIp`, `SrcPort`, `DstIp`, `DstPort`, `Protocol`, `Domain`. По ним ищется сразу в обоих источниках, например `SrcIp="10.208.24.74"` вернёт и DNS-запросы, и соединения.
-- `Domain` у DNS это запрошенное имя, у FirePower хост из `ClientAppURL`, если FirePower его определил.
-- Поле FirePower `timestamp` служебное для SigLens, поэтому оно переименовано в `OrigTimestamp`. Номер протокола лежит в `OrigProtocol`, а в `Protocol` записано TCP или UDP.
+| Колонки | Откуда |
+|---|---|
+| `EventTime`, `SourceType`, `Device` | время события, `dns` или `firepower`, имя DNS-сервера или адрес FirePower |
+| `SrcIp`, `SrcPort`, `DstIp`, `DstPort`, `Protocol` | у DNS это `Remote IP` и `UDP/TCP indicator`, у FirePower initiator и responder, протокол словом (TCP, UDP) |
+| `Domain` | у DNS запрошенное имя, у FirePower хост из `clientAppURL`, если FirePower его определил |
+| `DnsQueryType`, `DnsResponseCode`, `DnsMessage`, `DnsId` | тип записи, код ответа, query или response, Xid |
+| `RuleAction`, `RuleReason`, `PacketsSent`, `PacketsReceived`, `BytesSent`, `BytesReceived` | как в FirePower, коды действий не расшифрованы |
+| `Url`, `SecurityIntelligence` | `clientAppURL` и имена списков Security Intelligence, например `Tor_exit_node` |
+
+Общие колонки нужны, чтобы искать сразу в обоих источниках: `SrcIp="10.208.24.74"` вернёт и DNS-запросы, и соединения.
+
+С ключом `--all-fields` к ним добавляются все исходные поля. Из имён убираются пробелы и точки: `Question Name` становится `QuestionName`, `flowStatistics.tcpFlags` становится `TcpFlags`. Если имя совпадает с общей колонкой или служебным полем SigLens, к нему добавляется `Orig`: поле FirePower `timestamp` будет `OrigTimestamp`, номер протокола `OrigProtocol`.
 
 Время события:
 
 - У DNS берётся из полей `Date` и `Time`. Это время самого DNS-сервера, а не syslog-заголовка: заголовок пишется при пересылке и идёт не по порядку.
-- У FirePower берётся начало соединения `FirstPacketTimestamp`. Если его нет, то `timestamp` записи.
-- Всё переводится в UTC, поэтому отправлять нужно с `--utc`. В каком поясе записано местное время в логе, задаёт ключ `--tz`, по умолчанию `+03:00`. Если пояс указан неверно, DNS и соединения разъедутся на несколько часов. Чтобы это поймать, парсер сверяет время записи FirePower с его же `CurrentTime` и предупреждает, если они не совпадают.
+- У FirePower берётся начало соединения `firstPacketTimestamp`. Если его нет, то `timestamp` записи.
+- `EventTime` пишется как в логе, но с поясом: `2021-09-07 11:23:53+0300`. Пояс задаёт ключ `--tz`, по умолчанию `+03:00`. Отправщик видит пояс в самом времени, поэтому `--utc` не нужен.
+- Если пояс указан неверно, DNS и соединения разъедутся на несколько часов. Чтобы это поймать, парсер сверяет время записи FirePower с его же `CurrentTime` и предупреждает, если они не совпадают.
 
 Примеры запросов:
 
@@ -124,7 +134,7 @@ BytesReceived>1000 | stats sum(BytesReceived) by DstIp
 | `--time-column` | `TimeStamp` | колонка со временем события |
 | `--time-format` | `%Y-%m-%d %H:%M:%S` | формат времени, как в `datetime.strptime` |
 | `--int-columns` | `Status,ClientPort,FrontendPort` | колонки, которые отправлять числами |
-| `--utc` | выключен | считать время в логе как UTC, иначе как местное время машины |
+| `--utc` | выключен | считать время в логе как UTC, иначе как местное время машины. Не действует, если пояс записан в самом времени (`%z` в формате) |
 | `--force` | выключен | отправлять, даже если в индексе уже есть события за этот период |
 
 ## Особенности SigLens, о которые легко споткнуться

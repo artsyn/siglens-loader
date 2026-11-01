@@ -29,7 +29,8 @@ RESERVED = ("timestamp", "index")
 
 def to_epoch_ms(text, time_format, utc):
     dt = datetime.strptime(text.strip(), time_format)
-    if utc:
+    # Если пояс записан в самом времени (%z), --utc не нужен
+    if utc and dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
 
