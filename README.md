@@ -68,6 +68,41 @@ python3 send_to_siglens.py mail_log.csv
 
 После этого интерфейс открыт на http://localhost:5122. В нём нужно выбрать индекс и диапазон времени, в который попадает лог.
 
+## Лог DNS и Cisco FirePower
+
+Второй формат это текстовая выгрузка, где вперемешку лежат строки с DNS-сервера Windows и с Cisco FirePower (eStreamer). Поля записаны как `ключ=значение` через табуляцию, у DNS перед ними ещё syslog-заголовок. openpyxl для него не нужен.
+
+```bash
+./siglens_up.sh
+python3 kv_to_csv.py logs.txt
+python3 send_to_siglens.py logs.csv --index caldera --time-column EventTime --utc \
+    --int-columns SrcPort,DstPort,BytesSent,BytesReceived,PacketsSent,PacketsReceived
+```
+
+Парсер в конце сам печатает нужную команду отправки.
+
+Что делает `kv_to_csv.py`:
+
+- Сохраняет все исходные поля, но убирает из имён пробелы и точки: `Question Name` становится `QuestionName`, `flowStatistics.responderPort` становится `ResponderPort`.
+- Добавляет общие колонки `EventTime`, `SourceType`, `SrcIp`, `SrcPort`, `DstIp`, `DstPort`, `Protocol`, `Domain`. По ним ищется сразу в обоих источниках, например `SrcIp="10.208.24.74"` вернёт и DNS-запросы, и соединения.
+- `Domain` у DNS это запрошенное имя, у FirePower хост из `ClientAppURL`, если FirePower его определил.
+- Поле FirePower `timestamp` служебное для SigLens, поэтому оно переименовано в `OrigTimestamp`. Номер протокола лежит в `OrigProtocol`, а в `Protocol` записано TCP или UDP.
+
+Время события:
+
+- У DNS берётся из полей `Date` и `Time`. Это время самого DNS-сервера, а не syslog-заголовка: заголовок пишется при пересылке и идёт не по порядку.
+- У FirePower берётся начало соединения `FirstPacketTimestamp`. Если его нет, то `timestamp` записи.
+- Всё переводится в UTC, поэтому отправлять нужно с `--utc`. В каком поясе записано местное время в логе, задаёт ключ `--tz`, по умолчанию `+03:00`. Если пояс указан неверно, DNS и соединения разъедутся на несколько часов. Чтобы это поймать, парсер сверяет время записи FirePower с его же `CurrentTime` и предупреждает, если они не совпадают.
+
+Примеры запросов:
+
+```
+Domain=*syncthing*
+DstPort=22067
+SrcIp="10.208.24.74" | stats count by SourceType
+BytesReceived>1000 | stats sum(BytesReceived) by DstIp
+```
+
 ## Настройки
 
 `siglens_up.sh` читает переменные окружения:
